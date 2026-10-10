@@ -121,7 +121,7 @@ jobs:
           app="$(find ipa-check/Payload -maxdepth 1 -name '*.app' -print -quit)"
           plutil -lint "$app/Info.plist"
           exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
-          xcrun lipo -verify_arch arm64 "$app/$exe"
+          xcrun lipo "$app/$exe" -verify_arch arm64
           platform="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$app/Info.plist")"
           test "$platform" = iPhoneOS
           orientations="$(/usr/libexec/PlistBuddy -c 'Print :UISupportedInterfaceOrientations' "$app/Info.plist")"
