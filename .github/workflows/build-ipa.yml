@@ -90,6 +90,21 @@ jobs:
           replace('tests/src/com/unciv/utils/SafeAreaViewportTest.kt',
               '    @Test fun fullScreenLayoutUsesTheEntireScreenAndReportsSafeBounds() {',
               test + '\n    @Test fun fullScreenLayoutUsesTheEntireScreenAndReportsSafeBounds() {')
+          replace('ios/robovm.xml',
+              '    <forceLinkClasses>',
+              '    <forceLinkClasses>\n        <!-- libGDX JSON resolves save-model generic types through reflection. -->\n        <pattern>com.unciv.**</pattern>')
+          replace('ios/robovm.properties', 'app.version=4.21.14', 'app.version=4.22.5')
+          replace('ios/robovm.properties', 'app.build=1', 'app.build=2')
+          replace('ios/build.gradle.kts', 'val expectedIosVersion = "4.21.14"', 'val expectedIosVersion = "4.22.5"')
+          replace('ios/build.gradle.kts',
+              '        check(robovmConfig.contains("<pattern>com.android.org.conscrypt.**</pattern>")) {',
+              '        check(robovmConfig.contains("<pattern>com.unciv.**</pattern>")) {\n            "robovm.xml must retain Unciv classes resolved through JSON reflection"\n        }\n        check(robovmConfig.contains("<pattern>com.android.org.conscrypt.**</pattern>")) {')
+          p = root / 'tests/src/com/unciv/app/IOSSerializationSmoke.java'
+          p.parent.mkdir(parents=True, exist_ok=True)
+          p.write_text('package com.unciv.app;\n\nimport com.badlogic.gdx.utils.Json;\nimport com.unciv.json.UncivJsonKt;\nimport com.unciv.logic.GameInfo;\nimport com.unciv.logic.achievements.AchievementGameState;\nimport com.unciv.logic.achievements.AchievementHistory;\nimport java.io.File;\nimport java.io.PrintWriter;\n\n/** Shared JVM/native regression for the first autosave\'s reflective clone path. */\npublic final class IOSSerializationSmoke {\n    public static void check() {\n        // Empty collections still require resolving their generic element classes.\n        new AchievementHistory().clone();\n        Json json = UncivJsonKt.json();\n        // Resolve nested types via JSON, without directly referencing the missing class.\n        String fixture = "{\\"mountainParties\\":[{\\"turn\\":7,\\"members\\":[\\"one\\",\\"two\\"]}],"\n            + "\\"units\\":{\\"42\\":{\\"keshikAttacks\\":[{\\"origin\\":\\"0,0\\",\\"moved\\":true}]}},"\n            + "\\"pendingCaptures\\":{\\"42\\":{\\"unitId\\":42}}}";\n        AchievementHistory history = json.fromJson(AchievementHistory.class, fixture);\n        AchievementGameState state = new AchievementGameState();\n        state.setHistory(history);\n        GameInfo game = new GameInfo();\n        game.setAchievements(state);\n        GameInfo copy = game.clone();\n        require(copy.getAchievements().getHistory().getMountainParties().size() == 1, "clone lost mountain party");\n        String saved = json.toJson(copy);\n        GameInfo loaded = json.fromJson(GameInfo.class, saved);\n        AchievementHistory restored = loaded.getAchievements().getHistory();\n        require(restored.getMountainParties().size() == 1, "save round trip lost mountain party");\n        require(restored.getUnits().size() == 1, "save round trip lost unit history");\n        require(restored.getPendingCaptures().size() == 1, "save round trip lost capture history");\n        require(saved.contains("keshikAttacks") && saved.contains("0,0") && saved.contains("two"), "nested facts lost");\n        copy.getAchievements().getHistory().getMountainParties().clear();\n        require(history.getMountainParties().size() == 1, "autosave clone shares mutable history");\n    }\n\n    private static void require(boolean valid, String message) {\n        if (!valid) throw new AssertionError(message);\n    }\n\n    public static void main(String[] args) throws Exception {\n        File documents = new File(System.getProperty("user.home"), "Documents");\n        documents.mkdirs();\n        File report = new File(documents, "unciv-serialization-smoke.txt");\n        int status = 0;\n        try (PrintWriter writer = new PrintWriter(report, "UTF-8")) {\n            try {\n                check();\n                writer.println("PASS: native empty-history clone, populated GameInfo clone, JSON save/load and independent history");\n            } catch (Throwable failure) {\n                status = 1;\n                writer.println("FAIL");\n                failure.printStackTrace(writer);\n            }\n        }\n        System.exit(status);\n    }\n}\n')
+          p = root / 'tests/src/com/unciv/app/IOSSerializationSmokeTest.java'
+          p.parent.mkdir(parents=True, exist_ok=True)
+          p.write_text('package com.unciv.app;\n\nimport org.junit.Test;\n\npublic class IOSSerializationSmokeTest {\n    @Test public void autosaveCloneAndJsonRoundTripPreserveGenericAchievementTypes() {\n        IOSSerializationSmoke.check();\n    }\n}\n')
           PY
           git -C source diff --check
       - name: Run safe-area regression tests and iOS checks
@@ -99,7 +114,7 @@ jobs:
           set -euo pipefail
           unset ANDROID_HOME ANDROID_SDK_ROOT
           chmod +x gradlew
-          ./gradlew --no-daemon --no-configuration-cache :tests:test --tests com.unciv.utils.SafeAreaViewportTest --tests com.unciv.utils.SafeInsetsTest
+          ./gradlew --no-daemon --no-configuration-cache :tests:test --tests com.unciv.utils.SafeAreaViewportTest --tests com.unciv.utils.SafeInsetsTest --tests com.unciv.app.IOSSerializationSmokeTest --tests com.unciv.logic.achievements.AchievementFoundationTest.saveRoundTripAndUndoCloneKeepIndependentState
           ./gradlew --no-daemon --no-configuration-cache :ios:check :ios-backend:check
       - name: Build unsigned arm64 device IPA
         working-directory: source
@@ -127,15 +142,69 @@ jobs:
           orientations="$(/usr/libexec/PlistBuddy -c 'Print :UISupportedInterfaceOrientations' "$app/Info.plist")"
           [[ "$orientations" == *UIInterfaceOrientationLandscapeLeft* ]]
           [[ "$orientations" == *UIInterfaceOrientationLandscapeRight* ]]
-          cp "$ipa" dist/Unciv-iPhone16Pro-unsigned.ipa
+          cp "$ipa" dist/Unciv-iPhone16Pro-build2-unsigned.ipa
           git -C source diff > dist/source-changes.patch
           cp source/LICENSE dist/LICENSE-source.txt
-          printf '%s\n' 'Public iOS source: https://github.com/jerry8870/Unciv4iOS' 'Base commit: 47bfb558646ef451cb175753c2c3bc8d0d638f2a' 'Default app version: 4.21.14; not latest Android upstream.' 'Unsigned arm64 device IPA. Sign with your sideload tool.' 'Controls respect UIKit safe-area insets, including fullscreen mode.' 'Physical iPhone 16 Pro behavior has not yet been tested.' 'This public default build does not include the separate TestFlight iCloud runtime.' > dist/BUILD-INFO.txt
-          (cd dist && shasum -a 256 Unciv-iPhone16Pro-unsigned.ipa > SHA256SUMS.txt)
+          printf '%s\n' 'Public iOS source: https://github.com/jerry8870/Unciv4iOS' 'Base commit: 47bfb558646ef451cb175753c2c3bc8d0d638f2a' 'Core and bundle version: 4.22.5, build 2. Reflection-linked autosave fix.' 'Unsigned arm64 device IPA. Sign with your sideload tool.' 'Controls respect UIKit safe-area insets, including fullscreen mode.' 'Build 1 reached WorldScreen on iPhone 16 Pro / iOS 18.6.2 but crashed at autosave; build 2 awaits physical retest.' 'This public default build does not include the separate TestFlight iCloud runtime.' > dist/BUILD-INFO.txt
+          (cd dist && shasum -a 256 Unciv-iPhone16Pro-build2-unsigned.ipa > SHA256SUMS.txt)
+      - name: Run native iOS simulator autosave regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset ANDROID_HOME ANDROID_SDK_ROOT
+          xcrun simctl list devices available --json > work-simulators.json
+          sdk="$(xcrun --sdk iphonesimulator --show-sdk-version)"
+          python3 - "$sdk" <<'PY'
+          import json, sys
+          from pathlib import Path
+          runtime = 'com.apple.CoreSimulator.SimRuntime.iOS-' + sys.argv[1].replace('.', '-')
+          available = json.loads(Path('work-simulators.json').read_text())['devices'].get(runtime, [])
+          devices = [d for d in available if d.get('isAvailable') and d['name'].startswith('iPhone')]
+          assert devices, f'No available iPhone simulator for {runtime}'
+          device = sorted(devices, key=lambda d: (d['name'] != 'iPhone 16 Pro', d['name']))[0]
+          Path('selected-simulator.json').write_text(json.dumps(device, indent=2))
+          Path('sim-udid.txt').write_text(device['udid'])
+          Path('sim-name.txt').write_text(device['name'])
+          Path('sim-state.txt').write_text(device['state'])
+          ios = Path('source/ios')
+          target = ios / 'src/com/unciv/app/IOSSerializationSmoke.java'
+          target.write_text(Path('source/tests/src/com/unciv/app/IOSSerializationSmoke.java').read_text())
+          config = (ios / 'robovm.xml').read_text().replace('${app.mainclass}', 'com.unciv.app.IOSSerializationSmoke')
+          (ios / 'serialization-smoke.xml').write_text(config)
+          PY
+          sim="$(cat sim-udid.txt)"
+          sim_name="$(cat sim-name.txt)"
+          if [[ "$(cat sim-state.txt)" != Booted ]]; then xcrun simctl boot "$sim"; fi
+          xcrun simctl bootstatus "$sim" -b
+          (
+            cd source
+            ./gradlew --no-daemon --no-configuration-cache :ios:launchIPhoneSimulator -PiosSkipSigning=true -Probovm.arch=arm64 -Probovm.archs=arm64 -Probovm.device.name="$sim_name" -Probovm.sdk.version="$sdk" -PiosMainClass=com.unciv.app.IOSSerializationSmoke -PiosRoboVmConfig=serialization-smoke.xml
+          ) > native-smoke-build.log 2>&1 &
+          smoke_pid=$!
+          trap 'kill "$smoke_pid" 2>/dev/null || true' EXIT
+          report=""
+          for attempt in $(seq 1 240); do
+            data_dir="$(xcrun simctl get_app_container "$sim" com.aishuati.unciv data 2>/dev/null || true)"
+            if [[ -n "$data_dir" && -f "$data_dir/Documents/unciv-serialization-smoke.txt" ]]; then
+              report="$data_dir/Documents/unciv-serialization-smoke.txt"
+              break
+            fi
+            if ! kill -0 "$smoke_pid" 2>/dev/null; then break; fi
+            sleep 5
+          done
+          tail -n 80 native-smoke-build.log
+          test -n "$report"
+          cp "$report" dist/native-serialization-smoke.txt
+          cp selected-simulator.json dist/selected-simulator.json
+          cat dist/native-serialization-smoke.txt
+          grep -q '^PASS:' dist/native-serialization-smoke.txt
+          kill "$smoke_pid" 2>/dev/null || true
+          wait "$smoke_pid" 2>/dev/null || true
+          trap - EXIT
       - name: Upload IPA for sideload signing
         uses: actions/upload-artifact@v4
         with:
-          name: Unciv-iPhone16Pro-unsigned
+          name: Unciv-iPhone16Pro-build2-unsigned
           path: dist/
           if-no-files-found: error
           retention-days: 14
@@ -145,8 +214,13 @@ jobs:
         with:
           name: build-diagnostics
           path: |
+            native-smoke-build.log
+            selected-simulator.json
+            work-simulators.json
+            dist/
             source/tests/build/reports/
             source/ios/build/default/reports/
             source/ios-backend/build/reports/
           if-no-files-found: ignore
           retention-days: 7
+
