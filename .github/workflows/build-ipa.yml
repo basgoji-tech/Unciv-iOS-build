@@ -1,0 +1,152 @@
+# Source modifications retain the upstream MPL-2.0 license.
+name: Build unsigned iPhone IPA
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-ipa.yml'
+permissions:
+  contents: read
+concurrency:
+  group: unciv-unsigned-ipa
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Download pinned public iOS source
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          git init source
+          git -C source remote add origin https://github.com/jerry8870/Unciv4iOS.git
+          git -C source fetch --depth 1 origin 47bfb558646ef451cb175753c2c3bc8d0d638f2a
+          git -C source checkout --detach FETCH_HEAD
+      - name: Keep controls clear of Dynamic Island and the home indicator
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          root = Path('source')
+          def replace(path, old, new):
+              p = root / path
+              s = p.read_text()
+              assert s.count(old) == 1, f'Unexpected source in {path}'
+              p.write_text(s.replace(old, new))
+          replace('core/src/com/unciv/ui/screens/basescreen/SafeAreaViewport.kt',
+              '    private val useFullScreenLayout: Boolean = false,\n) : ExtendViewport(virtualSize, virtualSize) {',
+              '    useFullScreenLayout: Boolean = false,\n    keepControlsInSafeArea: Boolean = false,\n) : ExtendViewport(virtualSize, virtualSize) {\n    // Edge-to-edge drawing may extend the map, but iOS controls must remain unobscured.\n    private val useFullScreenLayout = useFullScreenLayout && !keepControlsInSafeArea')
+          replace('core/src/com/unciv/ui/screens/basescreen/BaseScreen.kt',
+              '        stage = UncivStage(SafeAreaViewport(height, useFullScreenLayout))',
+              '        stage = UncivStage(SafeAreaViewport(\n            height,\n            useFullScreenLayout,\n            keepControlsInSafeArea = Gdx.app.type == com.badlogic.gdx.Application.ApplicationType.iOS,\n        ))')
+          replace('tests/build.gradle.kts',
+              '    testImplementation(libs.junit)',
+              '    testImplementation(libs.junit)\n    // ViewPurityTest uses kotlin.reflect.full; core\'s implementation is not exported.\n    testImplementation(libs.kotlin.reflect)')
+          test = '''    @Test fun iphone16ProControlsStaySafeWithFullscreenEnabledAcrossRotation() {
+                  // 16 Pro logical screen size; representative insets, not a model-specific lookup table.
+                  // UIKit supplies actual insets at runtime, including both landscape orientations.
+                  val viewport = SafeAreaViewport(500f, useFullScreenLayout = true, keepControlsInSafeArea = true)
+                  repeat(2) {
+                      for ((width, height, insets) in listOf(
+                          Triple(874, 402, SafeInsets(62, 0, 62, 21)),
+                          Triple(874, 402, SafeInsets(62, 0, 0, 21)),
+                          Triple(874, 402, SafeInsets(0, 0, 62, 21)),
+                          Triple(402, 874, SafeInsets(0, 62, 0, 34)),
+                      )) {
+                          screen(width, height)
+                          for (fullscreen in listOf(false, true)) {
+                              viewport.updateDisplay(width, height, insets, fullscreen)
+                              val origin = viewport.project(Vector2())
+                              val corner = viewport.project(Vector2(viewport.worldWidth, viewport.worldHeight))
+                              assertEquals(insets.left.toFloat(), origin.x, 0.001f)
+                              assertEquals(insets.bottom.toFloat(), origin.y, 0.001f)
+                              assertEquals((width - insets.right).toFloat(), corner.x, 0.001f)
+                              assertEquals((height - insets.top).toFloat(), corner.y, 0.001f)
+                              val control = Vector2(viewport.worldWidth / 2, viewport.worldHeight / 2)
+                              val touch = viewport.project(control.cpy())
+                              touch.y = height - touch.y
+                              assertTrue(control.epsilonEquals(viewport.unproject(touch), 0.001f))
+                              if (fullscreen) {
+                                  val map = viewport.drawingBounds
+                                  assertTrue(Vector2().epsilonEquals(viewport.project(Vector2(map.x, map.y)), 0.001f))
+                                  assertTrue(Vector2(width.toFloat(), height.toFloat()).epsilonEquals(
+                                      viewport.project(Vector2(map.x + map.width, map.y + map.height)), 0.001f))
+                              }
+                          }
+                      }
+                  }
+              }
+          '''
+          replace('tests/src/com/unciv/utils/SafeAreaViewportTest.kt',
+              '    @Test fun fullScreenLayoutUsesTheEntireScreenAndReportsSafeBounds() {',
+              test + '\n    @Test fun fullScreenLayoutUsesTheEntireScreenAndReportsSafeBounds() {')
+          PY
+          git -C source diff --check
+      - name: Run safe-area regression tests and iOS checks
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset ANDROID_HOME ANDROID_SDK_ROOT
+          chmod +x gradlew
+          ./gradlew --no-daemon --no-configuration-cache :tests:test --tests com.unciv.utils.SafeAreaViewportTest --tests com.unciv.utils.SafeInsetsTest
+          ./gradlew --no-daemon --no-configuration-cache :ios:check :ios-backend:check
+      - name: Build unsigned arm64 device IPA
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          unset ANDROID_HOME ANDROID_SDK_ROOT
+          ./gradlew --no-daemon --no-configuration-cache :ios:createIPA -PiosSkipSigning=true -Probovm.arch=arm64 -Probovm.archs=arm64
+      - name: Validate IPA and record provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          ipa="$(find source/ios/build/default -type f -name '*.ipa' -print -quit)"
+          test -n "$ipa"
+          unzip -tq "$ipa"
+          mkdir -p dist ipa-check
+          unzip -q "$ipa" -d ipa-check
+          test "$(find ipa-check/Payload -maxdepth 1 -name '*.app' | wc -l | tr -d ' ')" -eq 1
+          app="$(find ipa-check/Payload -maxdepth 1 -name '*.app' -print -quit)"
+          plutil -lint "$app/Info.plist"
+          exe="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
+          xcrun lipo -verify_arch arm64 "$app/$exe"
+          platform="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$app/Info.plist")"
+          test "$platform" = iPhoneOS
+          orientations="$(/usr/libexec/PlistBuddy -c 'Print :UISupportedInterfaceOrientations' "$app/Info.plist")"
+          [[ "$orientations" == *UIInterfaceOrientationLandscapeLeft* ]]
+          [[ "$orientations" == *UIInterfaceOrientationLandscapeRight* ]]
+          cp "$ipa" dist/Unciv-iPhone16Pro-unsigned.ipa
+          git -C source diff > dist/source-changes.patch
+          cp source/LICENSE dist/LICENSE-source.txt
+          printf '%s\n' 'Public iOS source: https://github.com/jerry8870/Unciv4iOS' 'Base commit: 47bfb558646ef451cb175753c2c3bc8d0d638f2a' 'Default app version: 4.21.14; not latest Android upstream.' 'Unsigned arm64 device IPA. Sign with your sideload tool.' 'Controls respect UIKit safe-area insets, including fullscreen mode.' 'Physical iPhone 16 Pro behavior has not yet been tested.' 'This public default build does not include the separate TestFlight iCloud runtime.' > dist/BUILD-INFO.txt
+          (cd dist && shasum -a 256 Unciv-iPhone16Pro-unsigned.ipa > SHA256SUMS.txt)
+      - name: Upload IPA for sideload signing
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unciv-iPhone16Pro-unsigned
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload build reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: |
+            source/tests/build/reports/
+            source/ios/build/default/reports/
+            source/ios-backend/build/reports/
+          if-no-files-found: ignore
+          retention-days: 7
